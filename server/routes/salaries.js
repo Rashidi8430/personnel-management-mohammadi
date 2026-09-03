@@ -1,130 +1,186 @@
 /**
- * حقوق و دستمزد (فیش حقوقی)
+ * ماژول محاسبه، ثبت و مشاهده فیش حقوقی پرسنل
+ * مسیر پایه: /api/salaries
  */
 
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/database');
+const pool = require('../database');
 const { verifyToken, checkRole } = require('../middleware/auth');
 
-// دریافت فیش حقوقی (عامل کامل، سرپرست و پرسنل فقط خودشان)
-router.get('/:userId/:year/:month', verifyToken, async (req, res) => {
+router.use(verifyToken);
+
+/**
+ * @route   GET /api/salaries
+ * @desc    دریافت لیست فیش‌های حقوقی
+ */
+router.get('/', async (req, res) => {
+  const { user_id, month, year } = req.query;
+  const currentUserId = req.user.id;
+  const currentUserRole = req.user.role;
+
   try {
-    const { userId, year, month } = req.params;
+    let query = `
+      SELECT s.id, s.user_id, u.full_name, u.role, s.salary_month, s.salary_year,
+             s.base_salary, s.overtime_pay, s.bonuses, s.deductions, s.net_salary,
+             s.payment_status, s.payment_date, s.note, s.created_at
+      FROM salaries s
+      JOIN users u ON s.user_id = u.id
+      WHERE 1=1
+    `;
+    const params = [];
 
-    // بررسی دسترسی
-    if (req.user.role === 'employee' && req.user.id !== parseInt(userId)) {
-      return res.status(403).json({
-        success: false,
-        message: 'تنها می‌توانید فیش خود را مشاهده کنید'
-      });
+    // پرسنل فقط فیش حقوقی خود را می‌بینند
+    if (currentUserRole !== 'manager') {
+      params.push(currentUserId);
+      query += ` AND s.user_id = $${params.length}`;
+    } else if (user_id) {
+      params.push(parseInt(user_id, 10));
+      query += ` AND s.user_id = $${params.length}`;
     }
 
-    if (req.user.role === 'supervisor' && req.user.id !== parseInt(userId)) {
-      return res.status(403).json({
-        success: false,
-        message: 'تنها می‌توانید فیش خود را مشاهده کنید'
-      });
+    if (month) {
+      params.push(parseInt(month, 10));
+      query += ` AND s.salary_month = $${params.length}`;
     }
 
-    const salaryDate = new Date(year, month - 1, 1);
-
-    const result = await pool.query(
-      `SELECT s.*, u.first_name, u.last_name, u.position FROM salaries s
-       JOIN users u ON s.user_id = u.id
-       WHERE s.user_id = $1 AND s.salary_month = $2`,
-      [userId, salaryDate]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: true,
-        data: null,
-        message: 'فیش حقوقی برای این ماه ثبت نشده'
-      });
+    if (year) {
+      params.push(parseInt(year, 10));
+      query += ` AND s.salary_year = $${params.length}`;
     }
 
-    res.json({
+    query += ' ORDER BY s.salary_year DESC, s.salary_month DESC';
+
+    const { rows } = await pool.query(query, params);
+
+    return res.status(200).json({
       success: true,
-      data: result.rows[0]
+      count: rows.length,
+      data: rows
     });
   } catch (error) {
-    console.error('Get salary error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در واکشی فیش‌های حقوق:', error);
+    return res.status(500).json({ success: false, message: 'خطا در دریافت لیست فیش‌های حقوق' });
   }
 });
 
-// ثبت/بروزرسانی فیش حقوقی (فقط عامل)
-router.post('/create', verifyToken, checkRole('admin'), async (req, res) => {
+/**
+ * @route   POST /api/salaries
+ * @desc    صدور فیش حقوقی جدید (فقط مدیر)
+ */
+router.post('/', checkRole('manager'), async (req, res) => {
+  const {
+    user_id,
+    salary_month,
+    salary_year,
+    base_salary,
+    overtime_pay = 0,
+    bonuses = 0,
+    deductions = 0,
+    note
+  } = req.body;
+
+  if (!user_id || !salary_month || !salary_year || base_salary === undefined) {
+    return res.status(400).json({
+      success: false,
+      message: 'ورود پرسنل، ماه، سال و حقوق پایه الزامی است'
+    });
+  }
+
+  const base = Number(base_salary);
+  const overtime = Number(overtime_pay);
+  const bonus = Number(bonuses);
+  const deduct = Number(deductions);
+  const net = base + overtime + bonus - deduct;
+
   try {
-    const { user_id, salary_month, base_salary, bonus, deductions, insurance, notes } = req.body;
+    const insertQuery = `
+      INSERT INTO salaries (
+        user_id, salary_month, salary_year, base_salary,
+        overtime_pay, bonuses, deductions, net_salary,
+        payment_status, note
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)
+      ON CONFLICT (user_id, salary_month, salary_year)
+      DO UPDATE SET
+        base_salary = EXCLUDED.base_salary,
+        overtime_pay = EXCLUDED.overtime_pay,
+        bonuses = EXCLUDED.bonuses,
+        deductions = EXCLUDED.deductions,
+        net_salary = EXCLUDED.net_salary,
+        note = EXCLUDED.note,
+        updated_at = NOW()
+      RETURNING *
+    `;
 
-    if (!user_id || !salary_month) {
-      return res.status(400).json({
-        success: false,
-        message: 'اطلاعات الزامی را پر کنید'
-      });
-    }
+    const { rows } = await pool.query(insertQuery, [
+      parseInt(user_id, 10),
+      parseInt(salary_month, 10),
+      parseInt(salary_year, 10),
+      base,
+      overtime,
+      bonus,
+      deduct,
+      net,
+      note ? String(note).trim() : null
+    ]);
 
-    const salaryDate = new Date(salary_month);
-    const total_salary = (base_salary || 0) + (bonus || 0) - (deductions || 0);
-
-    const result = await pool.query(
-      `INSERT INTO salaries (user_id, salary_month, base_salary, bonus, deductions, insurance, total_salary, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       ON CONFLICT (user_id, salary_month) DO UPDATE SET
-       base_salary = EXCLUDED.base_salary,
-       bonus = EXCLUDED.bonus,
-       deductions = EXCLUDED.deductions,
-       insurance = EXCLUDED.insurance,
-       total_salary = EXCLUDED.total_salary,
-       notes = EXCLUDED.notes,
-       updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [user_id, salaryDate, base_salary || 0, bonus || 0, deductions || 0, insurance || 0, total_salary, notes || null, req.user.id]
-    );
-
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      message: 'فیش حقوقی ثبت شد',
-      data: result.rows[0]
+      message: 'فیش حقوقی با موفقیت صادر شد',
+      data: rows[0]
     });
   } catch (error) {
-    console.error('Create salary error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
+    console.time_pay);
+  const bonus = Number(bonuses);
+  const deduct = Number(deductions);
+  const net = base + overtime + bonus - deduct;
+
+  try {
+    const insertQuery = `
+      INSERT INTO salaries (
+        user_id, salary_month, salary_year, base_salary,
+        overtime_pay, bonuses, deductions, net_salary,
+        payment_status, note
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)
+      ON CONFLICT (user_id, salary_month, salary_year)
+      DO UPDATE SET
+        base_salary = EXCLUDED.base_salary,
+        overtime_pay = EXCLUDED.overtime_pay,
+        bonuses = EXCLUDED.bonuses,
+        deductions = EXCLUDED.deductions,
+        net_salary = EXCLUDED.net_salary,
+        note = EXCLUDED.note,
+        updated_at = NOW()
+      RETURNING *
+    `;
+
+    const { rows } = await pool.query(insertQuery, [
+      parseInt(user_id, 10),
+      parseInt(salary_month, 10),
+      parseInt(salary_year, 10),
+      base,
+      overtime,
+      bonus,
+      deduct,
+      net,
+      note ? String(note).trim() : null
+    ]);
+
+    return res.status(201).json({
+      success: true,
+      message: 'فیش حقوقی با موفقیت صادر شد',
+      data: rows[0]
     });
+  } catch (error) {
+    console.error('❌ خطا در صدور فیش حقوق:', error);
+    return res.status(500).json({ success: false, message: 'خطا در ثبت فیش حقوقی' });
   }
 });
 
-// دریافت تمام فیش‌های یک پرسنل (فقط عامل)
-router.get('/history/:userId', verifyToken, checkRole('admin'), async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const result = await pool.query(
-      `SELECT s.*, u.first_name, u.last_name FROM salaries s
-       JOIN users u ON s.user_id = u.id
-       WHERE s.user_id = $1
-       ORDER BY s.salary_month DESC`,
-      [userId]
-    );
-
-    res.json({
-      success: true,
-      data: result.rows
-    });
-  } catch (error) {
-    console.error('Get salary history error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
-  }
-});
-
-module.exports = router;
+/**
+ * @route   PUT /api/salaries/:id/pay
+ * @desc    تغییر وضعیت پرداخت به پرداخت‌شده (Paid)
+ */
+router.put('/:
