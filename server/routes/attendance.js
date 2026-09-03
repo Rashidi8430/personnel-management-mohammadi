@@ -1,122 +1,119 @@
 /**
- * حضور و غیاب
+ * ماژول گزارش‌گیری و مدیریت سوابق تردد پرسنل
+ * مسیر پایه: /api/attendance
  */
 
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/database');
+const pool = require('../database');
 const { verifyToken, checkRole } = require('../middleware/auth');
 
-// دریافت حضور و غیاب یک ماه
-router.get('/month/:userId/:year/:month', verifyToken, async (req, res) => {
-  try {
-    const { userId, year, month } = req.params;
+router.use(verifyToken);
 
-    // بررسی دسترسی
-    if (req.user.role === 'employee' && req.user.id !== parseInt(userId)) {
-      return res.status(403).json({
-        success: false,
-        message: 'دسترسی غیرمجاز'
-      });
+/**
+ * @route   GET /api/attendance
+ * @desc    دریافت لیست ترددها (پرسنل عادی فقط تردد خود، مدیر/سرپرست همه)
+ */
+router.get('/', async (req, res) => {
+  const { start_date, end_date, user_id } = req.query;
+  const currentUserId = req.user.id;
+  const currentUserRole = req.user.role;
+
+  try {
+    let query = `
+      SELECT a.id, a.user_id, u.full_name, u.role, a.check_in, a.check_out,
+             a.total_hours, a.device_info, a.note, a.created_at
+      FROM attendance a
+      JOIN users u ON a.user_id = u.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    // اگر مدیر یا سرپرست نبود، فقط رکوردهای خودش
+    if (currentUserRole !== 'manager' && currentUserRole !== 'supervisor') {
+      params.push(currentUserId);
+      query += ` AND a.user_id = $${params.length}`;
+    } else if (user_id) {
+      params.push(parseInt(user_id, 10));
+      query += ` AND a.user_id = $${params.length}`;
     }
 
-    const startDate = new Date(year, month - 1, 1);
-    const endDate = new Date(year, month, 0);
+    if (start_date) {
+      params.push(start_date);
+      query += ` AND a.check_in >= $${params.length}`;
+    }
 
-    const result = await pool.query(
-      `SELECT a.*, u.first_name, u.last_name FROM attendance a
-       JOIN users u ON a.user_id = u.id
-       WHERE a.user_id = $1 AND a.attendance_date >= $2 AND a.attendance_date <= $3
-       ORDER BY a.attendance_date`,
-      [userId, startDate, endDate]
-    );
+    if (end_date) {
+      params.push(end_date);
+      query += ` AND a.check_in <= $${params.length}`;
+    }
 
-    res.json({
+    query += ' ORDER BY a.check_in DESC';
+
+    const { rows } = await pool.query(query, params);
+
+    return res.status(200).json({
       success: true,
-      data: result.rows
+      count: rows.length,
+      data: rows
     });
   } catch (error) {
-    console.error('Get attendance error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در دریافت ترددها:', error);
+    return res.status(500).json({ success: false, message: 'خطا در دریافت لیست تردد' });
   }
 });
 
-// ثبت حضور و غیاب
-router.post('/record', verifyToken, async (req, res) => {
-  try {
-    const { user_id, attendance_date, status, check_in_time, check_out_time, notes } = req.body;
+/**
+ * @route   PUT /api/attendance/:id
+ * @desc    اصلاح دستی رکورد تردد پرسنل توسط مدیر یا سرپرست
+ */
+router.put('/:id', checkRole('manager', 'supervisor'), async (req, res) => {
+  const recordId = parseInt(req.params.id, 10);
+  const { check_in, check_out, note } = req.body;
 
-    // بررسی دسترسی
-    if (req.user.role === 'employee' && req.user.id !== user_id) {
-      return res.status(403).json({
-        success: false,
-        message: 'تنها می‌توانید حضور و غیاب خود را ثبت کنید'
-      });
-    }
-
-    if (req.user.role === 'employee' && status !== 'present') {
-      return res.status(403).json({
-        success: false,
-        message: 'تنها می‌توانید حضور را ثبت کنید'
-      });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO attendance (user_id, attendance_date, status, check_in_time, check_out_time, notes)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (user_id, attendance_date) DO UPDATE SET
-       status = EXCLUDED.status, check_in_time = EXCLUDED.check_in_time, 
-       check_out_time = EXCLUDED.check_out_time, notes = EXCLUDED.notes,
-       updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [user_id, attendance_date, status, check_in_time || null, check_out_time || null, notes || null]
-    );
-
-    res.status(201).json({
-      success: true,
-      message: 'حضور و غیاب ثبت شد',
-      data: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Record attendance error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+  if (isNaN(recordId)) {
+    return res.status(400).json({ success: false, message: 'شناسه رکورد نامعتبر است' });
   }
-});
 
-// تایید حضور و غیاب (فقط سرپرست)
-router.put('/verify/:id', verifyToken, checkRole('supervisor'), async (req, res) => {
   try {
-    const result = await pool.query(
-      `UPDATE attendance SET verified_by = $1, verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
-       RETURNING *`,
-      [req.user.id, req.params.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'حضور و غیاب یافت نشد'
-      });
+    let totalHours = null;
+    if (check_in && check_out) {
+      const diffMs = new Date(check_out) - new Date(check_in);
+      if (diffMs > 0) {
+        totalHours = parseFloat((diffMs / (1000 * 60 * 60)).toFixed(2));
+      }
     }
 
-    res.json({
+    const updateQuery = `
+      UPDATE attendance
+      SET check_in = COALESCE($1, check_in),
+          check_out = COALESCE($2, check_out),
+          total_hours = COALESCE($3, total_hours),
+          note = COALESCE($4, note)
+      WHERE id = $5
+      RETURNING *
+    `;
+
+    const { rows } = await pool.query(updateQuery, [
+      check_in || null,
+      check_out || null,
+      totalHours,
+      note ? String(note).trim() : null,
+      recordId
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'رکورد تردد یافت نشد' });
+    }
+
+    return res.status(200).json({
       success: true,
-      message: 'حضور و غیاب تایید شد',
-      data: result.rows[0]
+      message: 'رکورد تردد با موفقیت ویرایش شد',
+      data: rows[0]
     });
   } catch (error) {
-    console.error('Verify attendance error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در ویرایش تردد:', error);
+    return res.status(500).json({ success: false, message: 'خطا در ویرایش رکورد تردد' });
   }
 });
 
