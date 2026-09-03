@@ -1,111 +1,144 @@
 /**
- * برنامه شیفت
+ * ماژول مدیریت و زمان‌بندی شیفت‌های کاری پرسنل
+ * مسیر پایه: /api/schedules
  */
 
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/database');
+const pool = require('../database');
 const { verifyToken, checkRole } = require('../middleware/auth');
 
-// دریافت برنامه شیفت
-router.get('/week/:year/:week', verifyToken, async (req, res) => {
+router.use(verifyToken);
+
+/**
+ * @route   GET /api/schedules
+ * @desc    دریافت لیست شیفت‌ها بر اساس بازه تاریخ
+ * @access  تمام پرسنل (دیدن شیفت‌های فروشگاه)
+ */
+router.get('/', async (req, res) => {
+  const { start_date, end_date, user_id } = req.query;
+
   try {
-    const { year, week } = req.params;
+    let query = `
+      SELECT s.id, s.user_id, u.full_name, u.role, s.shift_date, s.shift_type,
+             s.start_time, s.end_time, s.note, s.created_at
+      FROM schedules s
+      JOIN users u ON s.user_id = u.id
+      WHERE 1=1
+    `;
+    const params = [];
 
-    const simple = new Date(year, 0, 1 + (week - 1) * 7);
-    const day = simple.getDay();
-    const diff = simple.getDate() - day + (day === 0 ? -6 : 1);
-    const startDate = new Date(simple.setDate(diff));
+    if (start_date) {
+      params.push(start_date);
+      query += ` AND s.shift_date >= $${params.length}`;
+    }
 
-    const result = await pool.query(
-      `SELECT s.*, u.first_name, u.last_name, u.position FROM schedules s
-       JOIN users u ON s.user_id = u.id
-       WHERE s.schedule_date >= $1 AND s.schedule_date < $2 + interval '7 days'
-       ORDER BY s.schedule_date, u.first_name`,
-      [startDate, startDate]
-    );
+    if (end_date) {
+      params.push(end_date);
+      query += ` AND s.shift_date <= $${params.length}`;
+    }
 
-    res.json({
+    if (user_id) {
+      params.push(parseInt(user_id, 10));
+      query += ` AND s.user_id = $${params.length}`;
+    }
+
+    query += ' ORDER BY s.shift_date DESC, s.start_time ASC';
+
+    const { rows } = await pool.query(query, params);
+
+    return res.status(200).json({
       success: true,
-      data: result.rows,
-      week_start: startDate
+      count: rows.length,
+      data: rows
     });
   } catch (error) {
-    console.error('Get schedule error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در واکشی شیفت‌ها:', error);
+    return res.status(500).json({ success: false, message: 'خطای سرور در دریافت شیفت‌ها' });
   }
 });
 
-// ثبت برنامه شیفت (فقط سرپرست)
-router.post('/create', verifyToken, checkRole('supervisor'), async (req, res) => {
-  try {
-    const { user_id, schedule_date, shift } = req.body;
+/**
+ * @route   POST /api/schedules
+ * @desc    تعریف شیفت کاری جدید برای پرسنل
+ * @access  مدیر و سرپرست (manager, supervisor)
+ */
+router.post('/', checkRole('manager', 'supervisor'), async (req, res) => {
+  const { user_id, shift_date, shift_type, start_time, end_time, note } = req.body;
 
-    if (!user_id || !schedule_date || !shift) {
-      return res.status(400).json({
+  if (!user_id || !shift_date || !shift_type || !start_time || !end_time) {
+    return res.status(400).json({
+      success: false,
+      message: 'ورود شناسه پرسنل، تاریخ، نوع شیفت، ساعت شروع و پایان الزامی است'
+    });
+  }
+
+  try {
+    // بررسی تکراری نبودن شیفت در همان تاریخ برای همان فرد
+    const checkDuplicate = await pool.query(
+      'SELECT id FROM schedules WHERE user_id = $1 AND shift_date = $2',
+      [user_id, shift_date]
+    );
+
+    if (checkDuplicate.rows.length > 0) {
+      return res.status(409).json({
         success: false,
-        message: 'اطلاعات الزامی را پر کنید'
+        message: 'برای این پرسنل در تاریخ انتخاب‌شده شیفت ثبت شده است'
       });
     }
 
-    const result = await pool.query(
-      `INSERT INTO schedules (user_id, schedule_date, shift, created_by)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, schedule_date) DO UPDATE SET
-       shift = EXCLUDED.shift, updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [user_id, schedule_date, shift, req.user.id]
-    );
+    const insertQuery = `
+      INSERT INTO schedules (user_id, shift_date, shift_type, start_time, end_time, note)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *
+    `;
 
-    res.status(201).json({
+    const { rows } = await pool.query(insertQuery, [
+      user_id,
+      shift_date,
+      shift_type,
+      start_time,
+      end_time,
+      note ? String(note).trim() : null
+    ]);
+
+    return res.status(201).json({
       success: true,
-      message: 'برنامه شیفت ثبت شد',
-      data: result.rows[0]
+      message: 'شیفت کاری با موفقیت ثبت شد',
+      data: rows[0]
     });
   } catch (error) {
-    console.error('Create schedule error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در ثبت شیفت:', error);
+    return res.status(500).json({ success: false, message: 'خطا در ذخیره‌سازی شیفت' });
   }
 });
 
-// دریافت برنامه شیفت یک پرسنل برای یک ماه
-router.get('/employee/:userId/:year/:month', verifyToken, async (req, res) => {
-  try {
-    const { userId, year, month } = req.params;
+/**
+ * @route   DELETE /api/schedules/:id
+ * @desc    حذف شیفت کاری
+ * @access  مدیر و سرپرست
+ */
+router.delete('/:id', checkRole('manager', 'supervisor'), async (req, res) => {
+  const shiftId = parseInt(req.params.id, 10);
 
-    if (req.user.role === 'employee' && req.user.id !== parseInt(userId)) {
-      return res.status(403).json({
-        success: false,
-        message: 'دسترسی غیرمجاز'
-      });
+  if (isNaN(shiftId)) {
+    return res.status(400).json({ success: false, message: 'شناسه شیفت نامعتبر است' });
+  }
+
+  try {
+    const result = await pool.query('DELETE FROM schedules WHERE id = $1 RETURNING id', [shiftId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'شیفت مورد نظر یافت نشد' });
     }
 
-    const startDate = new Date(year, month - 1, 1);
-    const endDate = new Date(year, month, 0);
-
-    const result = await pool.query(
-      `SELECT * FROM schedules
-       WHERE user_id = $1 AND schedule_date >= $2 AND schedule_date <= $3
-       ORDER BY schedule_date`,
-      [userId, startDate, endDate]
-    );
-
-    res.json({
+    return res.status(200).json({
       success: true,
-      data: result.rows
+      message: 'شیفت با موفقیت حذف شد'
     });
   } catch (error) {
-    console.error('Get employee schedule error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در حذف شیفت:', error);
+    return res.status(500).json({ success: false, message: 'خطا در حذف شیفت' });
   }
 });
 
