@@ -1,167 +1,124 @@
 /**
- * ارزیابی عملکرد
+ * ماژول ارزیابی عملکرد و ثبت امتیاز پرسنل
+ * مسیر پایه: /api/performance
  */
 
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/database');
+const pool = require('../database');
 const { verifyToken, checkRole } = require('../middleware/auth');
 
-// دریافت ارزیابی عملکرد
-router.get('/:userId/:year/:month', verifyToken, checkRole('supervisor', 'admin'), async (req, res) => {
+router.use(verifyToken);
+
+/**
+ * @route   GET /api/performance
+ * @desc    دریافت سوابق ارزیابی عملکرد
+ */
+router.get('/', async (req, res) => {
+  const { user_id, month, year } = req.query;
+  const currentUserId = req.user.id;
+  const currentUserRole = req.user.role;
+
   try {
-    const { userId, year, month } = req.params;
-    const evaluationDate = new Date(year, month - 1, 1);
+    let query = `
+      SELECT p.id, p.user_id, u.full_name, u.role, p.eval_month, p.eval_year,
+             p.score, p.criteria, p.feedback, p.created_at,
+             evaluator.full_name AS evaluated_by_name
+      FROM performance_reviews p
+      JOIN users u ON p.user_id = u.id
+      LEFT JOIN users evaluator ON p.evaluated_by = evaluator.id
+      WHERE 1=1
+    `;
+    const params = [];
 
-    const result = await pool.query(
-      `SELECT * FROM performance_evaluations
-       WHERE user_id = $1 AND evaluation_month = $2`,
-      [userId, evaluationDate]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: true,
-        data: null,
-        message: 'ارزیابی هنوز ثبت نشده'
-      });
+    // پرسنل عادی فقط ارزیابی‌های خود را می‌بینند
+    if (currentUserRole !== 'manager' && currentUserRole !== 'supervisor') {
+      params.push(currentUserId);
+      query += ` AND p.user_id = $${params.length}`;
+    } else if (user_id) {
+      params.push(parseInt(user_id, 10));
+      query += ` AND p.user_id = $${params.length}`;
     }
 
-    res.json({
+    if (month) {
+      params.push(parseInt(month, 10));
+      query += ` AND p.eval_month = $${params.length}`;
+    }
+
+    if (year) {
+      params.push(parseInt(year, 10));
+      query += ` AND p.eval_year = $${params.length}`;
+    }
+
+    query += ' ORDER BY p.eval_year DESC, p.eval_month DESC, p.created_at DESC';
+
+    const { rows } = await pool.query(query, params);
+
+    return res.status(200).json({
       success: true,
-      data: result.rows[0]
+      count: rows.length,
+      data: rows
     });
   } catch (error) {
-    console.error('Get performance error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در دریافت ارزیابی‌ها:', error);
+    return res.status(500).json({ success: false, message: 'خطا در دریافت ارزیابی عملکرد' });
   }
 });
 
-// ثبت/بروزرسانی ارزیابی توسط سرپرست
-router.post('/supervisor-evaluate', verifyToken, checkRole('supervisor'), async (req, res) => {
-  try {
-    const { user_id, evaluation_month, sales_score, organization_score, behavior_score, notes } = req.body;
+/**
+ * @route   POST /api/performance
+ * @desc    ثبت ارزیابی عملکرد جدید توسط مدیر یا سرپرست
+ */
+router.post('/', checkRole('manager', 'supervisor'), async (req, res) => {
+  const { user_id, eval_month, eval_year, score, criteria, feedback } = req.body;
 
-    if (!user_id || !evaluation_month) {
-      return res.status(400).json({
-        success: false,
-        message: 'اطلاعات الزامی را پر کنید'
-      });
-    }
-
-    const evaluationDate = new Date(evaluation_month);
-
-    const result = await pool.query(
-      `INSERT INTO performance_evaluations 
-       (user_id, evaluation_month, sales_score, organization_score, behavior_score, 
-        supervisor_notes, supervisor_evaluated_by, supervisor_evaluated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
-       ON CONFLICT (user_id, evaluation_month) DO UPDATE SET
-       sales_score = EXCLUDED.sales_score,
-       organization_score = EXCLUDED.organization_score,
-       behavior_score = EXCLUDED.behavior_score,
-       supervisor_notes = EXCLUDED.supervisor_notes,
-       supervisor_evaluated_by = EXCLUDED.supervisor_evaluated_by,
-       supervisor_evaluated_at = CURRENT_TIMESTAMP,
-       updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [user_id, evaluationDate, sales_score || null, organization_score || null, behavior_score || null, notes || null, req.user.id]
-    );
-
-    res.status(201).json({
-      success: true,
-      message: 'ارزیابی سرپرست ثبت شد',
-      data: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Supervisor evaluate error:', error);
-    res.status(500).json({
+  if (!user_id || !eval_month || !eval_year || score === undefined) {
+    return res.status(400).json({
       success: false,
-      message: 'خطای سرور'
+      message: 'ورود شناسه پرسنل، ماه، سال و امتیاز الزامی است'
     });
   }
-});
 
-// ثبت/بروزرسانی ارزیابی توسط عامل
-router.post('/admin-evaluate', verifyToken, checkRole('admin'), async (req, res) => {
-  try {
-    const { user_id, evaluation_month, admin_notes, is_best_employee } = req.body;
-
-    if (!user_id || !evaluation_month) {
-      return res.status(400).json({
-        success: false,
-        message: 'اطلاعات الزامی را پر کنید'
-      });
-    }
-
-    const evaluationDate = new Date(evaluation_month);
-
-    // محاسبه میانگین امتیازات
-    const scoreResult = await pool.query(
-      `SELECT 
-       (COALESCE(sales_score, 0) + COALESCE(organization_score, 0) + COALESCE(behavior_score, 0)) / 3 as overall
-       FROM performance_evaluations
-       WHERE user_id = $1 AND evaluation_month = $2`,
-      [user_id, evaluationDate]
-    );
-
-    const overallScore = scoreResult.rows.length > 0 ? scoreResult.rows[0].overall : null;
-
-    const result = await pool.query(
-      `INSERT INTO performance_evaluations 
-       (user_id, evaluation_month, admin_notes, admin_evaluated_by, admin_evaluated_at, overall_score, is_best_employee)
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5, $6)
-       ON CONFLICT (user_id, evaluation_month) DO UPDATE SET
-       admin_notes = EXCLUDED.admin_notes,
-       admin_evaluated_by = EXCLUDED.admin_evaluated_by,
-       admin_evaluated_at = CURRENT_TIMESTAMP,
-       overall_score = EXCLUDED.overall_score,
-       is_best_employee = EXCLUDED.is_best_employee,
-       updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [user_id, evaluationDate, admin_notes || null, req.user.id, overallScore, is_best_employee || false]
-    );
-
-    res.status(201).json({
-      success: true,
-      message: 'ارزیابی عامل ثبت شد',
-      data: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Admin evaluate error:', error);
-    res.status(500).json({
+  const numScore = Number(score);
+  if (isNaN(numScore) || numScore < 0 || numScore > 100) {
+    return res.status(400).json({
       success: false,
-      message: 'خطای سرور'
+      message: 'امتیاز باید عددی بین ۰ تا ۱۰۰ باشد'
     });
   }
-});
 
-// بهترین پرسنل ماه
-router.get('/best-employee/:year/:month', verifyToken, checkRole('admin', 'supervisor'), async (req, res) => {
   try {
-    const { year, month } = req.params;
-    const evaluationDate = new Date(year, month - 1, 1);
+    const insertQuery = `
+      INSERT INTO performance_reviews (user_id, eval_month, eval_year, score, criteria, feedback, evaluated_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (user_id, eval_month, eval_year)
+      DO UPDATE SET
+        score = EXCLUDED.score,
+        criteria = EXCLUDED.criteria,
+        feedback = EXCLUDED.feedback,
+        evaluated_by = EXCLUDED.evaluated_by,
+        updated_at = NOW()
+      RETURNING *
+    `;
 
-    const result = await pool.query(
-      `SELECT pe.*, u.first_name, u.last_name, u.position FROM performance_evaluations pe
-       JOIN users u ON pe.user_id = u.id
-       WHERE pe.evaluation_month = $1 AND pe.is_best_employee = TRUE`,
-      [evaluationDate]
-    );
+    const { rows } = await pool.query(insertQuery, [
+      parseInt(user_id, 10),
+      parseInt(eval_month, 10),
+      parseInt(eval_year, 10),
+      numScore,
+      criteria ? JSON.stringify(criteria) : null,
+      feedback ? String(feedback).trim() : null,
+      req.user.id
+    ]);
 
-    res.json({
+    return res.status(201).json({
       success: true,
-      data: result.rows
+      message: 'ارزیابی عملکرد با موفقیت ثبت شد',
+      data: rows[0]
     });
   } catch (error) {
-    console.error('Get best employee error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'خطای سرور'
-    });
+    console.error('❌ خطا در ثبت ارزیابی:', error);
+    return res.status(500).json({ success: false, message: 'خطا در ذخیره‌سازی ارزیابی عملکرد' });
   }
 });
 
