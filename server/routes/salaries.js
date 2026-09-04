@@ -183,4 +183,22 @@ router.post('/', checkRole('manager'), async (req, res) => {
  * @route   PUT /api/salaries/:id/pay
  * @desc    تغییر وضعیت پرداخت به پرداخت‌شده (Paid)
  */
-router.put('/:
+router.put('/:id/pay', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await req.db.query(
+      'UPDATE salaries SET status = $1, paid_at = NOW() WHERE id = $2 RETURNING *',
+      ['paid', id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'فیش حقوقی یافت نشد' });
+    }
+    return res.json({ success: true, message: 'وضعیت به پرداخت‌شده تغییر یافت', data: result.rows[0] });
+  } catch (error) {
+    console.error('❌ خطا در بروزرسانی وضعیت پرداخت:', error);
+    return res.status(500).json({ success: false, message: 'خطا در ثبت وضعیت پرداخت' });
+  }
+});
+
+module.exports = router;
+
